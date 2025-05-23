@@ -28,7 +28,7 @@ where
 
 type Callback<T> = Box<dyn AsyncFnMut<T>>;
 type VoidCallback = Box<dyn AsyncFnMut<()>>;
-type WebSocketCallback = Box<dyn for<'a> AsyncFnMut<&'a WebSocket>>;
+type WebSocketCallback = Box<dyn for<'a> AsyncFnMut<&'a WebSocket> + Send + 'static>;
 
 /// Represents various error types that can occur in the WebSocket client.
 #[derive(Error, Debug)]
