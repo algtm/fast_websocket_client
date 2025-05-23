@@ -28,6 +28,7 @@ where
 
 type Callback<T> = Box<dyn AsyncFnMut<T>>;
 type VoidCallback = Box<dyn AsyncFnMut<()>>;
+type WebSocketCallback = Box<dyn for<'a> AsyncFnMut<&'a WebSocket>>;
 
 /// Represents various error types that can occur in the WebSocket client.
 #[derive(Error, Debug)]
@@ -53,7 +54,7 @@ pub enum WebSocketClientError {
 #[derive(Default)]
 struct CallbackSet {
     /// Called when the connection is successfully established.
-    on_open: Option<VoidCallback>,
+    on_open: Option<WebSocketCallback>,
     /// Called when the connection is closed.
     on_close: Option<VoidCallback>,
     /// Called when an error occurs.
@@ -63,9 +64,9 @@ struct CallbackSet {
 }
 
 impl CallbackSet {
-    pub async fn call_on_open(&mut self) {
+    pub async fn call_on_open(&mut self, ws: &WebSocket) {
         if let Some(cb) = &mut self.on_open {
-            cb.call_mut(()).await;
+            cb.call_mut(ws).await;
         }
     }
     pub async fn call_on_message(&mut self, message: String) {
@@ -88,7 +89,7 @@ impl CallbackSet {
 /// Represents updates to callback functions.
 enum CallbackUpdate {
     /// Set the callback to be invoked on connection open.
-    Open(VoidCallback),
+    Open(WebSocketCallback),
     /// Set the callback to be invoked on connection close.
     Close(VoidCallback),
     /// Set the callback to be invoked on error.
@@ -314,7 +315,7 @@ impl WebSocket {
     /// Update the `on_open` callback.
     pub async fn on_open<F, Fut>(&self, f: F) -> &Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
+        F: FnMut(&WebSocket) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.update_callback(CallbackUpdate::Open(Box::new(f)))
@@ -403,7 +404,7 @@ impl WebSocketBuilder {
     /// Registers a callback to be invoked when the connection opens.
     pub fn on_open<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
+        F: FnMut(&WebSocket) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.callbacks.on_open = Some(Box::new(f));
@@ -491,11 +492,18 @@ async fn run(
     mut command_rx: mpsc::UnboundedReceiver<ClientCommand>,
 ) {
     let mut shutdown = false;
+    let (command_tx, _) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let ws = WebSocket {
+        command_tx,
+        task_handle: tokio::task::spawn(async {}),
+        shutdown_notifier: shutdown_rx,
+    };
 
     while !shutdown {
         match try_connect(url, &options).await {
             Ok(mut client) => {
-                callbacks.call_on_open().await;
+                callbacks.call_on_open(&ws).await;
                 let mut ping_timer = time::interval(config.ping_interval);
 
                 loop {
