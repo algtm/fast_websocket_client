@@ -124,7 +124,8 @@ pub mod client;
 pub use client as callback_client;
 #[cfg(feature = "callback_client")]
 pub use client::{
-    ClientConfig, ConnectionInitOptions, WebSocket, WebSocketBuilder, WebSocketClientError,
+    ClientCommand, ClientConfig, ConnectionInitOptions, WebSocket, WebSocketBuilder,
+    WebSocketClientError,
 };
 
 pub use fastwebsockets::OpCode;

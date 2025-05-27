@@ -1,7 +1,7 @@
 // try this example with
 // `cargo run --example wss_client`
 
-use fast_websocket_client::WebSocket;
+use fast_websocket_client::{ClientCommand, WebSocket};
 use tokio::time::{Duration, sleep};
 
 #[tokio::main(flavor = "current_thread")]
@@ -14,6 +14,12 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     .await;
     ws.on_message(|message| async move {
         println!("[MESSAGE] {}", message);
+    })
+    .await;
+
+    ws.on_open(|tx| async move {
+        println!("[OPEN] WebSocket connection opened.");
+        let _ = tx.send(ClientCommand::SendMessage("Hello, world!".to_string()));
     })
     .await;
 
