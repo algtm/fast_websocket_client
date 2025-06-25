@@ -37,6 +37,10 @@ pub enum WebSocketClientError {
     #[error("WebSocket connection failed: {0}")]
     ConnectionError(String),
 
+    /// Raised when the connection attempt times out.
+    #[error("Connection timeout after {0:?}")]
+    ConnectionTimeout(Duration),
+
     /// Raised when sending a message fails.
     #[error("Send failed: {0}")]
     SendError(String),
@@ -108,6 +112,10 @@ pub struct ClientConfig {
     ///
     /// **Default**: 10 seconds
     reconnect_delay: Duration,
+    /// Timeout for connection establishment.
+    ///
+    /// **Default**: 30 seconds
+    connect_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -115,6 +123,7 @@ impl Default for ClientConfig {
         Self {
             ping_interval: Duration::from_secs(30),
             reconnect_delay: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -124,6 +133,7 @@ impl ClientConfig {
     ///
     /// - `ping_interval`: 30 seconds  
     /// - `reconnect_delay`: 10 seconds
+    /// - `connect_timeout`: 30 seconds
     pub fn new() -> Self {
         Self::default()
     }
@@ -141,6 +151,14 @@ impl ClientConfig {
     /// **Default**: 10 seconds
     pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
         self.reconnect_delay = delay;
+        self
+    }
+
+    /// Sets the connection timeout duration.
+    ///
+    /// **Default**: 30 seconds
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }
@@ -503,7 +521,7 @@ async fn run(
     let mut shutdown = false;
 
     while !shutdown {
-        match try_connect(url, &options).await {
+        match try_connect(url, &options, config.connect_timeout).await {
             Ok(mut client) => {
                 callbacks.call_on_open(command_tx.clone()).await;
                 let mut ping_timer = time::interval(config.ping_interval);
@@ -577,6 +595,7 @@ async fn run(
 async fn try_connect(
     url: &str,
     options: &ConnectionInitOptions,
+    timeout: Duration,
 ) -> Result<base_client::Online, WebSocketClientError> {
     let mut offline = base_client::Offline::new();
     offline
@@ -590,8 +609,8 @@ async fn try_connect(
         offline.add_header(k.clone(), v.clone());
     }
 
-    offline
-        .connect(url)
+    tokio::time::timeout(timeout, offline.connect(url))
         .await
+        .map_err(|_| WebSocketClientError::ConnectionTimeout(timeout))?
         .map_err(|e| WebSocketClientError::ConnectionError(e.to_string()))
 }
