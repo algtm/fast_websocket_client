@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "fast_websocket_client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "fastwebsockets",
  "http-body-util",
