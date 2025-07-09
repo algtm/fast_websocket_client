@@ -1,41 +1,54 @@
 // try this example with
 // `cargo run --example wss_client`
 
-use fast_websocket_client::{ClientCommand, WebSocket};
+use fast_websocket_client::{ClientCommand, WebSocket, WebSocketBuilder};
 use tokio::time::{Duration, sleep};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    let ws = WebSocket::new("wss://echo.websocket.org").await?;
-
-    ws.on_close(|_| async move {
-        println!("[CLOSE] WebSocket connection closed.");
-    })
-    .await;
-    ws.on_message(|message| async move {
-        println!("[MESSAGE] {}", message);
-    })
-    .await;
-
-    ws.on_open(|tx| async move {
+#[tokio::test]
+async fn test_ws() -> Result<(), fast_websocket_client::WebSocketClientError> {
+    let mut ws_builder = WebSocketBuilder::new();
+    ws_builder = ws_builder.on_open(|tx| async move {
         println!("[OPEN] WebSocket connection opened.");
-        let _ = tx.send(ClientCommand::SendMessage("Hello, world!".to_string()));
-    })
-    .await;
+        // let _ = tx.send(ClientCommand::SendMessage("Hello, world!".to_string()));
+        sleep(Duration::from_secs(2)).await;
+        todo!("test panic");
+    });
+    ws_builder = ws_builder.on_close(|_| async move {
+        println!("[CLOSE] WebSocket connection closed.");
+    });
+    ws_builder = ws_builder.on_error(|e| async move {
+        println!("[ERROR] {}", e);
+    });
+    ws_builder = ws_builder.on_message(|message| async move {
+        println!("[MESSAGE] {}", message);
+    });
+    let ws = ws_builder
+        .connect("wss://ws-api.binance.com:443/ws-api/v3")
+        .await?;
 
-    sleep(Duration::from_secs(1)).await;
-    for i in 1..5 {
-        let message = format!("#{}", i);
-        if let Err(e) = ws.send(&message).await {
-            eprintln!("[ERROR] Send error: {:?}", e);
-            break;
-        }
-        println!("[SEND] {}", message);
-        sleep(Duration::from_secs(5)).await;
+    println!("await_shutdown");
+    // ws.await_shutdown().await;
+    // println!("await_shutdown done");
+    match ws.join().await {
+        Ok(_) => println!("ws end"),
+        Err(e) => println!("ws error: {:?}", e),
     }
+    // loop {
+    //     println!("loop");
+    //     sleep(Duration::from_secs(1)).await;
+    // }
 
-    ws.close().await;
-    ws.await_shutdown().await;
+    // sleep(Duration::from_secs(1)).await;
+    // for i in 1..5 {
+    //     let message = format!("#{}", i);
+    //     if let Err(e) = ws.send(&message).await {
+    //         eprintln!("[ERROR] Send error: {:?}", e);
+    //         break;
+    //     }
+    //     println!("[SEND] {}", message);
+    //     sleep(Duration::from_secs(5)).await;
+    // }
+
     Ok(())
 }
 
