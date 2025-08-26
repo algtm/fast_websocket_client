@@ -252,6 +252,8 @@ impl ConnectionInitOptions {
 
 // Represents commands sent to the WebSocket client runtime.
 pub enum ClientCommand {
+    /// Reconnect the connection.
+    Reconnect,
     /// Close the connection.
     Close,
     /// Update client configuration.
@@ -531,9 +533,13 @@ async fn run(
                         _ = ping_timer.tick() => {
                             let _ = client.send_ping("").await;
                         }
-
                         Some(cmd) = command_rx.recv() => {
                             match cmd {
+                                ClientCommand::Reconnect => {
+                                    let _ = client.send_close("").await;
+                                    callbacks.call_on_close().await;
+                                    break;
+                                },
                                 ClientCommand::Close => {
                                     let _ = client.send_close("").await;
                                     callbacks.call_on_close().await;
