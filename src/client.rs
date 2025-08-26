@@ -398,6 +398,11 @@ impl WebSocket {
             .send(ClientCommand::SendMessage(message.to_string()))
             .map_err(|e| WebSocketClientError::SendError(e.to_string()))
     }
+    pub async fn send_command(&self, command: ClientCommand) -> Result<(), WebSocketClientError> {
+        self.command_tx
+            .send(command)
+            .map_err(|e| WebSocketClientError::SendError(e.to_string()))
+    }
 }
 
 /// Builder for creating and connecting a WebSocket client with callbacks and options.
