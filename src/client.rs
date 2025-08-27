@@ -61,6 +61,8 @@ struct CallbackSet {
     on_open: Option<VoidCallback>,
     /// Called when the connection is closed.
     on_close: Option<VoidCallback>,
+    /// Called when a interval is reached.
+    on_interval: Option<VoidCallback>,
     /// Called when an error occurs.
     on_error: Option<Callback<String>>,
     /// Called when a text message is received.
@@ -88,6 +90,11 @@ impl CallbackSet {
             cb.call_mut(()).await;
         }
     }
+    pub async fn call_on_interval(&mut self) {
+        if let Some(cb) = &mut self.on_interval {
+            cb.call_mut(()).await;
+        }
+    }
 }
 
 /// Represents updates to callback functions.
@@ -100,6 +107,8 @@ enum CallbackUpdate {
     Error(Callback<String>),
     /// Set the callback to be invoked on message receive.
     Message(Callback<String>),
+    /// Set the callback to be invoked on interval.
+    Interval(VoidCallback),
 }
 
 /// Configuration options for the WebSocket client runtime behavior.
@@ -437,6 +446,15 @@ impl WebSocketBuilder {
         self.command_tx = Some(command_tx);
         self
     }
+    pub fn on_interval<F, Fut>(mut self, f: F) -> Self
+    where
+        F: FnMut(()) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.callbacks.on_interval = Some(Box::new(f));
+        self
+    }
+
     /// Registers a callback to be invoked when the connection opens.
     pub fn on_open<F, Fut>(mut self, f: F) -> Self
     where
@@ -549,6 +567,7 @@ async fn run(
                     tokio::select! {
                         _ = ping_timer.tick() => {
                             let _ = client.send_ping("").await;
+                            callbacks.call_on_interval().await;
                         }
                         Some(cmd) = command_rx.recv() => {
                             match cmd {
@@ -575,6 +594,7 @@ async fn run(
                                     CallbackUpdate::Close(f) => callbacks.on_close = Some(f),
                                     CallbackUpdate::Error(f) => callbacks.on_error = Some(f),
                                     CallbackUpdate::Message(f) => callbacks.on_message = Some(f),
+                                    CallbackUpdate::Interval(f) => callbacks.on_interval = Some(f),
                                 },
                                 ClientCommand::SendMessage(message) => {
                                     if let Err(e) = client.send_string(&message).await {
