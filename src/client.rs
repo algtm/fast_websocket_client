@@ -560,7 +560,50 @@ async fn run(
     while !shutdown {
         match try_connect(url, &options, config.connect_timeout).await {
             Ok(mut client) => {
+                // Consume and apply all pending `update` commands, including immediately following callback registrations
+                let message = loop {
+                    tokio::task::yield_now().await;
+                    match command_rx.try_recv() {
+                        Ok(ClientCommand::Reconnect) => {
+                            let _ = client.send_close("").await;
+                            break None;
+                        }
+                        Ok(ClientCommand::Close) => {
+                            let _ = client.send_close("").await;
+                            shutdown = true;
+                            break None;
+                        }
+                        Ok(ClientCommand::UpdateConfig(cfg)) => {
+                            config = cfg;
+                        }
+                        Ok(ClientCommand::UpdateOptions(opts)) => {
+                            options = opts;
+                        }
+                        Ok(ClientCommand::UpdateCallback(cb)) => match cb {
+                            CallbackUpdate::Open(f) => callbacks.on_open = Some(f),
+                            CallbackUpdate::Close(f) => callbacks.on_close = Some(f),
+                            CallbackUpdate::Error(f) => callbacks.on_error = Some(f),
+                            CallbackUpdate::Message(f) => callbacks.on_message = Some(f),
+                            CallbackUpdate::Interval(f) => callbacks.on_interval = Some(f),
+                        },
+                        Ok(ClientCommand::SendMessage(message)) => break Some(message),
+                        Err(mpsc::error::TryRecvError::Empty) => break None,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            shutdown = true;
+                            break None;
+                        }
+                    }
+                };
                 callbacks.call_on_open().await;
+                if let Some(message) = message
+                    && let Err(e) = client.send_string(&message).await
+                {
+                    callbacks.call_on_error(e.to_string()).await;
+                }
+                if shutdown {
+                    callbacks.call_on_close().await;
+                    break;
+                }
                 let mut ping_timer = time::interval(config.ping_interval);
 
                 loop {
@@ -573,7 +616,6 @@ async fn run(
                             match cmd {
                                 ClientCommand::Reconnect => {
                                     let _ = client.send_close("").await;
-                                    callbacks.call_on_close().await;
                                     break;
                                 },
                                 ClientCommand::Close => {
