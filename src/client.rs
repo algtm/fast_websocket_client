@@ -590,6 +590,7 @@ async fn run(
                         Err(mpsc::error::TryRecvError::Empty) => break None,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             shutdown = true;
+                            log::error!("command_rx disconnected, shutting down");
                             break None;
                         }
                     }
