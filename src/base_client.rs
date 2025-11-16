@@ -119,6 +119,8 @@ impl Offline {
         let port = url.port_or_known_default().expect("the port is unknown");
         let address = format!("{host}:{port}");
         let tcp_stream = tokio::net::TcpStream::connect(&address).await?;
+        // 设置TCP_NODELAY以减少延迟
+        tcp_stream.set_nodelay(true)?;
 
         let mut req_builder = hyper::Request::builder()
             .method("GET")
