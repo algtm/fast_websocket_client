@@ -396,6 +396,12 @@ impl WebSocket {
         let _ = self.task_handle.await;
     }
 
+    /// Joins the WebSocket task and returns its result.
+    /// This is an alias for the task_handle.await operation.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        self.task_handle.await
+    }
+
     /// Sends a text message over the connection.
     ///
     /// # Errors
@@ -674,7 +680,11 @@ async fn run(
                 callbacks.call_on_error(e.to_string()).await;
             }
         }
-        time::sleep(config.reconnect_delay).await;
+
+        // Only sleep for reconnect delay if we're not shutting down
+        if !shutdown {
+            time::sleep(config.reconnect_delay).await;
+        }
     }
 }
 
