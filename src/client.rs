@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -12,23 +10,8 @@ use crate::HeaderMap;
 use crate::OpCode;
 use crate::base_client;
 
-trait AsyncFnMut<T>: Send {
-    fn call_mut(&mut self, arg: T) -> Pin<Box<dyn Future<Output = ()> + Send>>;
-}
-
-impl<T, F, Fut> AsyncFnMut<T> for F
-where
-    F: FnMut(T) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    fn call_mut(&mut self, arg: T) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin((self)(arg))
-    }
-}
-
-type Callback<T> = Box<dyn AsyncFnMut<T>>;
-type VoidCallback = Box<dyn AsyncFnMut<()>>;
-// type OpenCallback = Box<dyn AsyncFnMut<mpsc::UnboundedSender<ClientCommand>>>;
+type Callback<T> = Box<dyn FnMut(T) + Send>;
+type VoidCallback = Box<dyn FnMut() + Send>;
 
 /// Represents various error types that can occur in the WebSocket client.
 #[derive(Error, Debug)]
@@ -70,45 +53,31 @@ struct CallbackSet {
 }
 
 impl CallbackSet {
-    pub async fn call_on_open(&mut self) {
+    pub fn call_on_open(&mut self) {
         if let Some(cb) = &mut self.on_open {
-            cb.call_mut(()).await;
+            cb();
         }
     }
-    pub async fn call_on_message(&mut self, message: String) {
+    pub fn call_on_message(&mut self, message: String) {
         if let Some(cb) = &mut self.on_message {
-            cb.call_mut(message).await;
+            cb(message);
         }
     }
-    pub async fn call_on_error(&mut self, message: String) {
+    pub fn call_on_error(&mut self, message: String) {
         if let Some(cb) = &mut self.on_error {
-            cb.call_mut(message).await;
+            cb(message);
         }
     }
-    pub async fn call_on_close(&mut self) {
+    pub fn call_on_close(&mut self) {
         if let Some(cb) = &mut self.on_close {
-            cb.call_mut(()).await;
+            cb();
         }
     }
-    pub async fn call_on_interval(&mut self) {
+    pub fn call_on_interval(&mut self) {
         if let Some(cb) = &mut self.on_interval {
-            cb.call_mut(()).await;
+            cb();
         }
     }
-}
-
-/// Represents updates to callback functions.
-enum CallbackUpdate {
-    /// Set the callback to be invoked on connection open.
-    Open(VoidCallback),
-    /// Set the callback to be invoked on connection close.
-    Close(VoidCallback),
-    /// Set the callback to be invoked on error.
-    Error(Callback<String>),
-    /// Set the callback to be invoked on message receive.
-    Message(Callback<String>),
-    /// Set the callback to be invoked on interval.
-    Interval(VoidCallback),
 }
 
 /// Configuration options for the WebSocket client runtime behavior.
@@ -269,8 +238,6 @@ pub enum ClientCommand {
     UpdateConfig(ClientConfig),
     /// Update connection initialization options.
     UpdateOptions(ConnectionInitOptions),
-    /// Update callback handlers.
-    UpdateCallback(CallbackUpdate),
     /// Send a text message.
     SendMessage(String),
 }
@@ -335,55 +302,6 @@ impl WebSocket {
         self
     }
 
-    /// Updates the callback handlers.
-    async fn update_callback(&self, cb: CallbackUpdate) -> &Self {
-        let _ = self.command_tx.send(ClientCommand::UpdateCallback(cb));
-        self
-    }
-
-    /// Update the `on_open` callback.
-    pub async fn on_open<F, Fut>(&self, f: F) -> &Self
-    where
-        F: FnMut(()) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.update_callback(CallbackUpdate::Open(Box::new(f)))
-            .await;
-        self
-    }
-
-    /// Update the `on_close` callback.
-    pub async fn on_close<F, Fut>(&self, f: F) -> &Self
-    where
-        F: FnMut(()) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.update_callback(CallbackUpdate::Close(Box::new(f)))
-            .await;
-        self
-    }
-
-    /// Update the `on_error` callback.
-    pub async fn on_error<F, Fut>(&self, f: F) -> &Self
-    where
-        F: FnMut(String) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.update_callback(CallbackUpdate::Error(Box::new(f)))
-            .await;
-        self
-    }
-
-    /// Update the `on_message` callback.
-    pub async fn on_message<F, Fut>(&self, f: F) -> &Self
-    where
-        F: FnMut(String) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.update_callback(CallbackUpdate::Message(Box::new(f)))
-            .await;
-        self
-    }
     /// Sends a command to close the connection.
     pub async fn close(&self) -> &Self {
         let _ = self.command_tx.send(ClientCommand::Close);
@@ -452,50 +370,45 @@ impl WebSocketBuilder {
         self.command_tx = Some(command_tx);
         self
     }
-    pub fn on_interval<F, Fut>(mut self, f: F) -> Self
+    pub fn on_interval<F>(mut self, f: F) -> Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
         self.callbacks.on_interval = Some(Box::new(f));
         self
     }
 
     /// Registers a callback to be invoked when the connection opens.
-    pub fn on_open<F, Fut>(mut self, f: F) -> Self
+    pub fn on_open<F>(mut self, f: F) -> Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
         self.callbacks.on_open = Some(Box::new(f));
         self
     }
 
     /// Registers a callback to be invoked when the connection closes.
-    pub fn on_close<F, Fut>(mut self, f: F) -> Self
+    pub fn on_close<F>(mut self, f: F) -> Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
         self.callbacks.on_close = Some(Box::new(f));
         self
     }
 
     /// Registers a callback to be invoked when an error occurs.
-    pub fn on_error<F, Fut>(mut self, f: F) -> Self
+    pub fn on_error<F>(mut self, f: F) -> Self
     where
-        F: FnMut(String) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut(String) + Send + 'static,
     {
         self.callbacks.on_error = Some(Box::new(f));
         self
     }
 
     /// Registers a callback to be invoked when a message is received.
-    pub fn on_message<F, Fut>(mut self, f: F) -> Self
+    pub fn on_message<F>(mut self, f: F) -> Self
     where
-        F: FnMut(String) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut(String) + Send + 'static,
     {
         self.callbacks.on_message = Some(Box::new(f));
         self
@@ -585,13 +498,6 @@ async fn run(
                         Ok(ClientCommand::UpdateOptions(opts)) => {
                             options = opts;
                         }
-                        Ok(ClientCommand::UpdateCallback(cb)) => match cb {
-                            CallbackUpdate::Open(f) => callbacks.on_open = Some(f),
-                            CallbackUpdate::Close(f) => callbacks.on_close = Some(f),
-                            CallbackUpdate::Error(f) => callbacks.on_error = Some(f),
-                            CallbackUpdate::Message(f) => callbacks.on_message = Some(f),
-                            CallbackUpdate::Interval(f) => callbacks.on_interval = Some(f),
-                        },
                         Ok(ClientCommand::SendMessage(message)) => break Some(message),
                         Err(mpsc::error::TryRecvError::Empty) => break None,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -601,14 +507,14 @@ async fn run(
                         }
                     }
                 };
-                callbacks.call_on_open().await;
+                callbacks.call_on_open();
                 if let Some(message) = message
                     && let Err(e) = client.send_string(&message).await
                 {
-                    callbacks.call_on_error(e.to_string()).await;
+                    callbacks.call_on_error(e.to_string());
                 }
                 if shutdown {
-                    callbacks.call_on_close().await;
+                    callbacks.call_on_close();
                     break;
                 }
                 let mut ping_timer = time::interval(config.ping_interval);
@@ -617,7 +523,7 @@ async fn run(
                     tokio::select! {
                         _ = ping_timer.tick() => {
                             let _ = client.send_ping("").await;
-                            callbacks.call_on_interval().await;
+                            callbacks.call_on_interval();
                         }
                         Some(cmd) = command_rx.recv() => {
                             match cmd {
@@ -627,7 +533,7 @@ async fn run(
                                 },
                                 ClientCommand::Close => {
                                     let _ = client.send_close("").await;
-                                    callbacks.call_on_close().await;
+                                    callbacks.call_on_close();
                                     shutdown = true;
                                     break;
                                 },
@@ -638,16 +544,9 @@ async fn run(
                                 ClientCommand::UpdateOptions(opts) => {
                                     options = opts;
                                 },
-                                ClientCommand::UpdateCallback(cb) => match cb {
-                                    CallbackUpdate::Open(f) => callbacks.on_open = Some(f),
-                                    CallbackUpdate::Close(f) => callbacks.on_close = Some(f),
-                                    CallbackUpdate::Error(f) => callbacks.on_error = Some(f),
-                                    CallbackUpdate::Message(f) => callbacks.on_message = Some(f),
-                                    CallbackUpdate::Interval(f) => callbacks.on_interval = Some(f),
-                                },
                                 ClientCommand::SendMessage(message) => {
                                     if let Err(e) = client.send_string(&message).await {
-                                        callbacks.call_on_error(e.to_string()).await;
+                                        callbacks.call_on_error(e.to_string());
                                     }
                                 },
                             }
@@ -657,18 +556,18 @@ async fn run(
                             match result {
                                 Ok(frame) => match frame.opcode {
                                     OpCode::Close => {
-                                        callbacks.call_on_close().await;
+                                        callbacks.call_on_close();
                                         break;
                                     },
                                     OpCode::Text => {
                                         if let Ok(text) = std::str::from_utf8(&frame.payload) {
-                                            callbacks.call_on_message(text.to_string()).await;
+                                            callbacks.call_on_message(text.to_string());
                                         }
                                     },
                                     _ => {},
                                 },
                                 Err(e) => {
-                                    callbacks.call_on_error(e.to_string()).await;
+                                    callbacks.call_on_error(e.to_string());
                                     break;
                                 }
                             }
@@ -677,7 +576,7 @@ async fn run(
                 }
             }
             Err(e) => {
-                callbacks.call_on_error(e.to_string()).await;
+                callbacks.call_on_error(e.to_string());
             }
         }
 

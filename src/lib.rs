@@ -33,20 +33,19 @@
 //! // `cargo run --example wss_client`
 //!
 //! use tokio::time::{Duration, sleep};
-//! use fast_websocket_client::WebSocket;
+//! use fast_websocket_client::{WebSocket, WebSocketBuilder};
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-//!     let ws = WebSocket::new("wss://echo.websocket.org").await?;
-//!
-//!     ws.on_close(|_| async move {
-//!         println!("[CLOSE] WebSocket connection closed.");
-//!     })
-//!     .await;
-//!     ws.on_message(|message| async move {
-//!         println!("[MESSAGE] {}", message);
-//!     })
-//!     .await;
+//!     let ws = WebSocketBuilder::new()
+//!         .on_close(|| {
+//!             println!("[CLOSE] WebSocket connection closed.");
+//!         })
+//!         .on_message(|message| {
+//!             println!("[MESSAGE] {}", message);
+//!         })
+//!         .connect("wss://echo.websocket.org")
+//!         .await?;
 //!
 //!     sleep(Duration::from_secs(1)).await;
 //!     for i in 1..5 {

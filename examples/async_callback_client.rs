@@ -1,53 +1,31 @@
 // try this example with
-// `cargo run --example wss_client`
+// `cargo run --example async_callback_client`
 
-use fast_websocket_client::{ClientCommand, WebSocket, WebSocketBuilder};
-use tokio::time::{Duration, sleep};
+use fast_websocket_client::WebSocketBuilder;
 
-#[tokio::test]
-async fn test_ws() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    let mut ws_builder = WebSocketBuilder::new();
-    ws_builder = ws_builder.on_open(|tx| async move {
-        println!("[OPEN] WebSocket connection opened.");
-        // let _ = tx.send(ClientCommand::SendMessage("Hello, world!".to_string()));
-        sleep(Duration::from_secs(2)).await;
-        todo!("test panic");
-    });
-    ws_builder = ws_builder.on_close(|_| async move {
-        println!("[CLOSE] WebSocket connection closed.");
-    });
-    ws_builder = ws_builder.on_error(|e| async move {
-        println!("[ERROR] {}", e);
-    });
-    ws_builder = ws_builder.on_message(|message| async move {
-        println!("[MESSAGE] {}", message);
-    });
-    let ws = ws_builder
+#[tokio::main]
+async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
+    let ws = WebSocketBuilder::new()
+        .on_open(|| {
+            println!("[OPEN] WebSocket connection opened.");
+        })
+        .on_close(|| {
+            println!("[CLOSE] WebSocket connection closed.");
+        })
+        .on_error(|e| {
+            println!("[ERROR] {}", e);
+        })
+        .on_message(|message| {
+            println!("[MESSAGE] {}", message);
+        })
         .connect("wss://ws-api.binance.com:443/ws-api/v3")
         .await?;
 
     println!("await_shutdown");
-    // ws.await_shutdown().await;
-    // println!("await_shutdown done");
     match ws.join().await {
         Ok(_) => println!("ws end"),
         Err(e) => println!("ws error: {:?}", e),
     }
-    // loop {
-    //     println!("loop");
-    //     sleep(Duration::from_secs(1)).await;
-    // }
-
-    // sleep(Duration::from_secs(1)).await;
-    // for i in 1..5 {
-    //     let message = format!("#{}", i);
-    //     if let Err(e) = ws.send(&message).await {
-    //         eprintln!("[ERROR] Send error: {:?}", e);
-    //         break;
-    //     }
-    //     println!("[SEND] {}", message);
-    //     sleep(Duration::from_secs(5)).await;
-    // }
 
     Ok(())
 }
