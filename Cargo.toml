@@ -21,6 +21,10 @@ repository = "https://github.com/Osteoporosis/fast_websocket_client/"
 name = "async_callback_client"
 path = "examples/async_callback_client.rs"
 
+[[example]]
+name = "multi_thread_client"
+path = "examples/multi_thread_client.rs"
+
 [dependencies]
 fastwebsockets = { version = "0.10.0", features = ["simd", "upgrade"] }
 http-body-util = "0.1.3"
@@ -40,6 +44,9 @@ tokio = { version = "1.45.1", default-features = false, features = [
 tokio-rustls = "0.26.2"
 url = "2.5.4"
 webpki-roots = "1.0.1"
+crossbeam-channel = "0.5.12"
+tungstenite = { version = "0.24.0", features = ["native-tls"] }
+native-tls = "0.2.12"
 
 [features]
 default = ["callback_client"]

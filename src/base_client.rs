@@ -218,7 +218,7 @@ impl Online {
         &mut self,
         data: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log::info!("Sending string: {}", data);
+        log::debug!("Sending string: {}", data);
         self._send_frame(fastwebsockets::Frame::text(data.as_bytes().into()))
             .await?;
         Ok(())

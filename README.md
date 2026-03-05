@@ -51,7 +51,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     sleep(Duration::from_secs(1)).await;
     for i in 1..5 {
         let message = format!("#{}", i);
-        if let Err(e) = ws.send(&message).await {
+        if let Err(e) = ws.send(&message) {
             eprintln!("[ERROR] Send error: {:?}", e);
             break;
         }
@@ -59,7 +59,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         sleep(Duration::from_secs(5)).await;
     }
 
-    ws.close().await;
+    ws.close();
     ws.await_shutdown().await;
     Ok(())
 }

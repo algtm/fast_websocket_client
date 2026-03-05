@@ -291,19 +291,19 @@ impl WebSocket {
     }
 
     /// Updates the client configuration at runtime.
-    pub async fn update_config(&self, config: ClientConfig) -> &Self {
+    pub fn update_config(&self, config: ClientConfig) -> &Self {
         let _ = self.command_tx.send(ClientCommand::UpdateConfig(config));
         self
     }
 
     /// Updates the connection initialization options.
-    pub async fn update_options(&self, opts: ConnectionInitOptions) -> &Self {
+    pub fn update_options(&self, opts: ConnectionInitOptions) -> &Self {
         let _ = self.command_tx.send(ClientCommand::UpdateOptions(opts));
         self
     }
 
     /// Sends a command to close the connection.
-    pub async fn close(&self) -> &Self {
+    pub fn close(&self) -> &Self {
         let _ = self.command_tx.send(ClientCommand::Close);
         self
     }
@@ -325,12 +325,12 @@ impl WebSocket {
     /// # Errors
     ///
     /// Returns [`WebSocketClientError::SendError`] if the message could not be sent.
-    pub async fn send(&self, message: &str) -> Result<(), WebSocketClientError> {
+    pub fn send(&self, message: &str) -> Result<(), WebSocketClientError> {
         self.command_tx
             .send(ClientCommand::SendMessage(message.to_string()))
             .map_err(|e| WebSocketClientError::SendError(e.to_string()))
     }
-    pub async fn send_command(&self, command: ClientCommand) -> Result<(), WebSocketClientError> {
+    pub fn send_command(&self, command: ClientCommand) -> Result<(), WebSocketClientError> {
         self.command_tx
             .send(command)
             .map_err(|e| WebSocketClientError::SendError(e.to_string()))
