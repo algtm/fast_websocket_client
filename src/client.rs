@@ -88,8 +88,22 @@ pub struct ClientConfig {
     ping_interval: Duration,
     /// Delay before attempting to reconnect after a disconnection.
     ///
+    /// Acts as the **initial** backoff when `reconnect_backoff` is enabled,
+    /// and as the fixed delay otherwise.
+    ///
     /// **Default**: 10 seconds
     reconnect_delay: Duration,
+    /// Upper bound for the exponential backoff. Only meaningful when
+    /// `reconnect_backoff` is enabled.
+    ///
+    /// **Default**: 30 seconds
+    max_reconnect_delay: Duration,
+    /// When `true`, reconnect delay grows exponentially (with jitter) up to
+    /// `max_reconnect_delay`. When `false`, every reconnect waits exactly
+    /// `reconnect_delay`.
+    ///
+    /// **Default**: `true`
+    reconnect_backoff: bool,
     /// Timeout for connection establishment.
     ///
     /// **Default**: 30 seconds
@@ -100,7 +114,9 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             ping_interval: Duration::from_secs(30),
-            reconnect_delay: Duration::from_secs(10),
+            reconnect_delay: Duration::from_secs(1),
+            max_reconnect_delay: Duration::from_secs(30),
+            reconnect_backoff: true,
             connect_timeout: Duration::from_secs(30),
         }
     }
@@ -110,7 +126,9 @@ impl ClientConfig {
     /// Creates a new default configuration.
     ///
     /// - `ping_interval`: 30 seconds  
-    /// - `reconnect_delay`: 10 seconds
+    /// - `reconnect_delay`: 1 second (initial backoff)
+    /// - `max_reconnect_delay`: 30 seconds
+    /// - `reconnect_backoff`: enabled
     /// - `connect_timeout`: 30 seconds
     pub fn new() -> Self {
         Self::default()
@@ -126,9 +144,37 @@ impl ClientConfig {
 
     /// Sets the reconnect delay duration.
     ///
-    /// **Default**: 10 seconds
+    /// When backoff is enabled (default), this is the **initial** backoff
+    /// for the first reconnect; subsequent attempts multiply by 2 (capped at
+    /// `max_reconnect_delay`) and add a random jitter. When backoff is
+    /// disabled, this is the fixed delay between reconnects.
+    ///
+    /// **Default**: 1 second
     pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
         self.reconnect_delay = delay;
+        self
+    }
+
+    /// Sets the upper bound for the exponential backoff.
+    ///
+    /// Only takes effect when `reconnect_backoff` is enabled.
+    ///
+    /// **Default**: 30 seconds
+    pub fn with_max_reconnect_delay(mut self, delay: Duration) -> Self {
+        self.max_reconnect_delay = delay;
+        self
+    }
+
+    /// Enables or disables exponential backoff with jitter on reconnect.
+    ///
+    /// When disabled, every reconnect waits exactly `reconnect_delay`.
+    /// Disabling backoff is generally a bad idea against a rate-limiting /
+    /// WAF-protected endpoint: multiple parallel clients will synchronize
+    /// their retries and amplify each other's failures.
+    ///
+    /// **Default**: `true` (backoff enabled)
+    pub fn with_reconnect_backoff(mut self, enabled: bool) -> Self {
+        self.reconnect_backoff = enabled;
         self
     }
 
@@ -475,16 +521,30 @@ async fn run(
     mut command_rx: mpsc::UnboundedReceiver<ClientCommand>,
 ) {
     let mut shutdown = false;
+    // Number of consecutive failed connect attempts. Reset to 0 as soon as the
+    // connection is successfully established. Used to compute exponential
+    // backoff on the next reconnect.
+    let mut consecutive_failures: u32 = 0;
 
     while !shutdown {
+        // Why we exited the previous iteration. Used to decide whether the
+        // trailing sleep should be a backoff (real failure / unexpected drop)
+        // or a short, fixed delay (user-requested Reconnect command).
+        let mut was_failure = true;
+
         match try_connect(url, &options, config.connect_timeout).await {
             Ok(mut client) => {
+                // Connection succeeded — reset the failure counter so that a
+                // future transient drop doesn't immediately jump to the cap.
+                consecutive_failures = 0;
+
                 // Consume and apply all pending `update` commands, including immediately following callback registrations
                 let message = loop {
                     tokio::task::yield_now().await;
                     match command_rx.try_recv() {
                         Ok(ClientCommand::Reconnect) => {
                             let _ = client.send_close("").await;
+                            was_failure = false;
                             break None;
                         }
                         Ok(ClientCommand::Close) => {
@@ -529,6 +589,8 @@ async fn run(
                             match cmd {
                                 ClientCommand::Reconnect => {
                                     let _ = client.send_close("").await;
+                                    // Explicit, user-initiated reconnect — do not back off.
+                                    was_failure = false;
                                     break;
                                 },
                                 ClientCommand::Close => {
@@ -582,9 +644,92 @@ async fn run(
 
         // Only sleep for reconnect delay if we're not shutting down
         if !shutdown {
-            time::sleep(config.reconnect_delay).await;
+            let delay = if was_failure {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                compute_backoff(&config, consecutive_failures)
+            } else {
+                // Explicit Reconnect command — reconnect ASAP.
+                config.reconnect_delay.min(Duration::from_millis(500))
+            };
+            log::info!(
+                "reconnect backoff: sleeping {:?} (failure #{})",
+                delay,
+                if was_failure { consecutive_failures } else { 0 }
+            );
+            time::sleep(delay).await;
         }
     }
+}
+
+/// Compute the next reconnect delay, applying exponential backoff with jitter
+/// when `reconnect_backoff` is enabled, or the fixed `reconnect_delay`
+/// otherwise.
+///
+/// Backoff sequence (without jitter) for the default config
+/// (`reconnect_delay=1s`, `max_reconnect_delay=30s`):
+///
+/// ```text
+/// failure #1 → 1s
+/// failure #2 → 2s
+/// failure #3 → 4s
+/// failure #4 → 8s
+/// failure #5 → 16s
+/// failure #6 → 30s (capped)
+/// ```
+///
+/// On top of the base delay we add a uniformly random jitter in `[0, base/2]`
+/// so that multiple clients (or multiple sockets in the same process) that
+/// happen to fail at the same time don't synchronise their retries and
+/// amplify a rate-limit / WAF condition. The jitter is seeded from
+/// `SystemTime` plus the failure counter and the address of `config`, which
+/// avoids pulling in a `rand` dependency while still giving good
+/// decorrelation between sockets.
+fn compute_backoff(config: &ClientConfig, failure_count: u32) -> Duration {
+    let base = config.reconnect_delay;
+    let cap = config.max_reconnect_delay.max(base);
+
+    if !config.reconnect_backoff || failure_count == 0 {
+        return base;
+    }
+
+    // Doubling backoff: base * 2^(n-1). `saturating_mul` keeps us safe from
+    // overflow; the `min(cap)` afterwards makes the cap the effective limit.
+    let mut exp = base;
+    for _ in 1..failure_count {
+        exp = match exp.checked_mul(2) {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    let base_delay = exp.min(cap);
+
+    // Jitter: uniformly distributed in [0, base_delay / 2].
+    //
+    // Why jitter? Without it, multiple sockets (or multiple sockets in the
+    // same process) that fail at the same instant will retry at the same
+    // instant too — and against a rate-limit / WAF-protected endpoint that
+    // synchronised retry *amplifies* the original failure (see e.g. the
+    // CloudFront 403 incident on bitget when several private sockets all
+    // reconnect every 10s in lockstep). A small amount of jitter decorrelates
+    // them.
+    //
+    // We use `SystemTime` nanos XOR'd with the address of `config` and the
+    // failure count as the entropy source. That's enough for decorrelation
+    // without pulling in a `rand` dependency.
+    let seed_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let cfg_addr = std::ptr::addr_of!(config) as usize as u128;
+    let mix = (seed_ns ^ cfg_addr ^ failure_count as u128).wrapping_mul(0x9E3779B97F4A7C15);
+    let jitter_max = base_delay.as_nanos() / 2;
+    let jitter_ns = if jitter_max == 0 {
+        0
+    } else {
+        (mix % jitter_max) as u64
+    };
+
+    base_delay + Duration::from_nanos(jitter_ns)
 }
 
 async fn try_connect(
