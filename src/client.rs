@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -513,6 +514,44 @@ impl WebSocketBuilder {
     }
 }
 
+const READER_EVENT_BUFFER: usize = 1024;
+
+enum ReaderEvent {
+    Text(String),
+    Close,
+    Error(String),
+}
+
+async fn read_frames(
+    mut reader: base_client::OnlineReader,
+    writer: base_client::SharedOnlineWriter,
+    event_tx: mpsc::Sender<ReaderEvent>,
+) {
+    loop {
+        match reader.receive_frame(&writer).await {
+            Ok(frame) => {
+                let event = match frame.opcode {
+                    OpCode::Close => ReaderEvent::Close,
+                    OpCode::Text => match String::from_utf8(frame.payload.into()) {
+                        Ok(text) => ReaderEvent::Text(text),
+                        Err(error) => ReaderEvent::Error(error.to_string()),
+                    },
+                    _ => continue,
+                };
+
+                let should_stop = matches!(event, ReaderEvent::Close | ReaderEvent::Error(_));
+                if event_tx.send(event).await.is_err() || should_stop {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = event_tx.send(ReaderEvent::Error(error.to_string())).await;
+                break;
+            }
+        }
+    }
+}
+
 async fn run(
     url: &str,
     mut config: ClientConfig,
@@ -533,22 +572,29 @@ async fn run(
         let mut was_failure = true;
 
         match try_connect(url, &options, config.connect_timeout).await {
-            Ok(mut client) => {
+            Ok(client) => {
                 // Connection succeeded — reset the failure counter so that a
                 // future transient drop doesn't immediately jump to the cap.
                 consecutive_failures = 0;
+                let (reader, writer) = client.into_split();
 
                 // Consume and apply all pending `update` commands, including immediately following callback registrations
                 let message = loop {
                     tokio::task::yield_now().await;
                     match command_rx.try_recv() {
                         Ok(ClientCommand::Reconnect) => {
-                            let _ = client.send_close("").await;
+                            let result = writer.lock().await.send_close("").await;
+                            if let Err(error) = result {
+                                callbacks.call_on_error(error.to_string());
+                            }
                             was_failure = false;
                             break None;
                         }
                         Ok(ClientCommand::Close) => {
-                            let _ = client.send_close("").await;
+                            let result = writer.lock().await.send_close("").await;
+                            if let Err(error) = result {
+                                callbacks.call_on_error(error.to_string());
+                            }
                             shutdown = true;
                             break None;
                         }
@@ -568,73 +614,105 @@ async fn run(
                     }
                 };
                 callbacks.call_on_open();
-                if let Some(message) = message
-                    && let Err(e) = client.send_string(&message).await
-                {
-                    callbacks.call_on_error(e.to_string());
+                let mut initial_send_failed = false;
+                if let Some(message) = message {
+                    let result = writer.lock().await.send_string(&message).await;
+                    if let Err(error) = result {
+                        callbacks.call_on_error(error.to_string());
+                        initial_send_failed = true;
+                    }
                 }
                 if shutdown {
                     callbacks.call_on_close();
                     break;
                 }
-                let mut ping_timer = time::interval(config.ping_interval);
 
-                loop {
-                    tokio::select! {
-                        _ = ping_timer.tick() => {
-                            let _ = client.send_ping("").await;
-                            callbacks.call_on_interval();
-                        }
-                        Some(cmd) = command_rx.recv() => {
-                            match cmd {
-                                ClientCommand::Reconnect => {
-                                    let _ = client.send_close("").await;
-                                    // Explicit, user-initiated reconnect — do not back off.
-                                    was_failure = false;
+                if !initial_send_failed {
+                    let (reader_event_tx, mut reader_event_rx) = mpsc::channel(READER_EVENT_BUFFER);
+                    let reader_task =
+                        tokio::spawn(read_frames(reader, Arc::clone(&writer), reader_event_tx));
+                    let mut ping_timer = time::interval(config.ping_interval);
+
+                    loop {
+                        tokio::select! {
+                            _ = ping_timer.tick() => {
+                                let result = writer.lock().await.send_ping("").await;
+                                if let Err(error) = result {
+                                    callbacks.call_on_error(error.to_string());
                                     break;
-                                },
-                                ClientCommand::Close => {
-                                    let _ = client.send_close("").await;
-                                    callbacks.call_on_close();
-                                    shutdown = true;
-                                    break;
-                                },
-                                ClientCommand::UpdateConfig(cfg) => {
-                                    config = cfg;
-                                    ping_timer = time::interval(config.ping_interval);
-                                },
-                                ClientCommand::UpdateOptions(opts) => {
-                                    options = opts;
-                                },
-                                ClientCommand::SendMessage(message) => {
-                                    if let Err(e) = client.send_string(&message).await {
-                                        callbacks.call_on_error(e.to_string());
-                                    }
-                                },
+                                }
+                                callbacks.call_on_interval();
                             }
-                        }
+                            command = command_rx.recv() => {
+                                let Some(command) = command else {
+                                    shutdown = true;
+                                    log::error!("command_rx disconnected, shutting down");
+                                    break;
+                                };
 
-                        result = client.receive_frame() => {
-                            match result {
-                                Ok(frame) => match frame.opcode {
-                                    OpCode::Close => {
-                                        callbacks.call_on_close();
+                                match command {
+                                    ClientCommand::Reconnect => {
+                                        let result = writer.lock().await.send_close("").await;
+                                        if let Err(error) = result {
+                                            callbacks.call_on_error(error.to_string());
+                                        }
+                                        // Explicit, user-initiated reconnect — do not back off.
+                                        was_failure = false;
                                         break;
                                     },
-                                    OpCode::Text => {
-                                        if let Ok(text) = std::str::from_utf8(&frame.payload) {
-                                            callbacks.call_on_message(text.to_string());
+                                    ClientCommand::Close => {
+                                        let result = writer.lock().await.send_close("").await;
+                                        if let Err(error) = result {
+                                            callbacks.call_on_error(error.to_string());
+                                        }
+                                        callbacks.call_on_close();
+                                        shutdown = true;
+                                        break;
+                                    },
+                                    ClientCommand::UpdateConfig(cfg) => {
+                                        config = cfg;
+                                        ping_timer = time::interval(config.ping_interval);
+                                    },
+                                    ClientCommand::UpdateOptions(opts) => {
+                                        options = opts;
+                                    },
+                                    ClientCommand::SendMessage(message) => {
+                                        let result = writer.lock().await.send_string(&message).await;
+                                        if let Err(error) = result {
+                                            callbacks.call_on_error(error.to_string());
+                                            break;
                                         }
                                     },
-                                    _ => {},
-                                },
-                                Err(e) => {
-                                    callbacks.call_on_error(e.to_string());
-                                    break;
+                                }
+                            }
+                            event = reader_event_rx.recv() => {
+                                match event {
+                                    Some(ReaderEvent::Text(text)) => {
+                                        callbacks.call_on_message(text);
+                                    }
+                                    Some(ReaderEvent::Close) => {
+                                        callbacks.call_on_close();
+                                        break;
+                                    }
+                                    Some(ReaderEvent::Error(error)) => {
+                                        callbacks.call_on_error(error);
+                                        break;
+                                    }
+                                    None => {
+                                        callbacks.call_on_error(
+                                            "WebSocket reader task stopped unexpectedly".to_string(),
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
+
+                    // Cancelling a read is safe only because the entire
+                    // connection and its parser state are discarded below.
+                    reader_task.abort();
+                    let _ = reader_task.await;
                 }
             }
             Err(e) => {

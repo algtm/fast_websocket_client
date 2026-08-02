@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
+
 /// Connects to the url and returns an Online client.
 pub async fn connect(url: &str) -> Result<self::Online, Box<dyn std::error::Error + Send + Sync>> {
     self::Offline::new().connect(url).await
@@ -159,30 +163,42 @@ impl Offline {
         ws.set_max_message_size(self.max_message_size);
         ws.set_auto_apply_mask(self.auto_apply_mask);
 
-        Ok(Online(fastwebsockets::FragmentCollector::new(ws)))
+        let (reader, writer) = ws.split(tokio::io::split);
+
+        Ok(Online {
+            reader: OnlineReader(fastwebsockets::FragmentCollectorRead::new(reader)),
+            writer: Arc::new(Mutex::new(OnlineWriter(writer))),
+        })
     }
 }
 
+type UpgradedIo = hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>;
+type UpgradedRead = tokio::io::ReadHalf<UpgradedIo>;
+type UpgradedWrite = tokio::io::WriteHalf<UpgradedIo>;
+
 /// Provides receive/send functions and configuration setters.
-pub struct Online(
-    fastwebsockets::FragmentCollector<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>,
-);
+pub struct Online {
+    reader: OnlineReader,
+    writer: SharedOnlineWriter,
+}
+
+pub(crate) struct OnlineReader(fastwebsockets::FragmentCollectorRead<UpgradedRead>);
+
+pub(crate) struct OnlineWriter(fastwebsockets::WebSocketWrite<UpgradedWrite>);
+
+pub(crate) type SharedOnlineWriter = Arc<Mutex<OnlineWriter>>;
 
 impl Online {
     /// Reads a frame. Text frames payload is guaranteed to be valid UTF-8.
     #[inline]
     pub async fn receive_frame(
         &mut self,
-    ) -> Result<fastwebsockets::Frame, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.read_frame().await?)
+    ) -> Result<fastwebsockets::Frame<'static>, Box<dyn std::error::Error + Send + Sync>> {
+        self.reader.receive_frame(&self.writer).await
     }
 
-    #[inline]
-    async fn _send_frame(
-        &mut self,
-        frame: fastwebsockets::Frame<'_>,
-    ) -> Result<(), fastwebsockets::WebSocketError> {
-        self.0.write_frame(frame).await
+    pub(crate) fn into_split(self) -> (OnlineReader, SharedOnlineWriter) {
+        (self.reader, self.writer)
     }
 
     /// Sends a ping frame to the stream.
@@ -191,14 +207,7 @@ impl Online {
         &mut self,
         data: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self._send_frame(fastwebsockets::Frame::new(
-            true,
-            crate::OpCode::Ping,
-            None,
-            data.as_bytes().into(),
-        ))
-        .await?;
-        Ok(())
+        self.writer.lock().await.send_ping(data).await
     }
 
     /// Sends a pong frame to the stream.
@@ -207,9 +216,7 @@ impl Online {
         &mut self,
         data: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self._send_frame(fastwebsockets::Frame::pong(data.as_bytes().into()))
-            .await?;
-        Ok(())
+        self.writer.lock().await.send_pong(data).await
     }
 
     /// Sends a string to the stream.
@@ -218,10 +225,7 @@ impl Online {
         &mut self,
         data: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log::debug!("Sending string: {}", data);
-        self._send_frame(fastwebsockets::Frame::text(data.as_bytes().into()))
-            .await?;
-        Ok(())
+        self.writer.lock().await.send_string(data).await
     }
 
     /// Sends a serialized json to the stream.
@@ -230,11 +234,7 @@ impl Online {
         &mut self,
         data: impl serde::Serialize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let json_bytes = serde_json::to_vec(&data)
-            .expect("Failed to serialize data passed to send_json into JSON");
-        self._send_frame(fastwebsockets::Frame::text(json_bytes.into()))
-            .await?;
-        Ok(())
+        self.writer.lock().await.send_json(data).await
     }
 
     /// Sends binary data to the stream.
@@ -243,9 +243,7 @@ impl Online {
         &mut self,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self._send_frame(fastwebsockets::Frame::binary(data.into()))
-            .await?;
-        Ok(())
+        self.writer.lock().await.send_binary(data).await
     }
 
     /// Sends a close frame to the stream.
@@ -253,12 +251,98 @@ impl Online {
         &mut self,
         data: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self._send_frame(fastwebsockets::Frame::close(
+        self.writer.lock().await.send_close(data).await
+    }
+}
+
+impl OnlineReader {
+    pub(crate) async fn receive_frame(
+        &mut self,
+        writer: &SharedOnlineWriter,
+    ) -> Result<fastwebsockets::Frame<'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let writer = Arc::clone(writer);
+        let mut send_obligated = move |frame| {
+            let writer = Arc::clone(&writer);
+            async move {
+                let mut writer = writer.lock().await;
+                if writer.0.is_closed() {
+                    return Ok(());
+                }
+                writer.0.write_frame(frame).await
+            }
+        };
+
+        Ok(self.0.read_frame(&mut send_obligated).await?)
+    }
+}
+
+impl OnlineWriter {
+    #[inline]
+    async fn send_frame(
+        &mut self,
+        frame: fastwebsockets::Frame<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.write_frame(frame).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn send_ping(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(fastwebsockets::Frame::new(
+            true,
+            crate::OpCode::Ping,
+            None,
+            data.as_bytes().into(),
+        ))
+        .await
+    }
+
+    async fn send_pong(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(fastwebsockets::Frame::pong(data.as_bytes().into()))
+            .await
+    }
+
+    pub(crate) async fn send_string(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::debug!("Sending string: {}", data);
+        self.send_frame(fastwebsockets::Frame::text(data.as_bytes().into()))
+            .await
+    }
+
+    async fn send_json(
+        &mut self,
+        data: impl serde::Serialize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let json_bytes = serde_json::to_vec(&data)
+            .expect("Failed to serialize data passed to send_json into JSON");
+        self.send_frame(fastwebsockets::Frame::text(json_bytes.into()))
+            .await
+    }
+
+    async fn send_binary(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(fastwebsockets::Frame::binary(data.into()))
+            .await
+    }
+
+    pub(crate) async fn send_close(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(fastwebsockets::Frame::close(
             fastwebsockets::CloseCode::Normal.into(),
             data.as_bytes(),
         ))
-        .await?;
-        Ok(())
+        .await
     }
 }
 
