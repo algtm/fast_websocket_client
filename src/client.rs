@@ -287,6 +287,8 @@ pub enum ClientCommand {
     UpdateOptions(ConnectionInitOptions),
     /// Send a text message.
     SendMessage(String),
+    /// Send multiple text messages contiguously before processing another command.
+    SendMessages(Vec<String>),
 }
 
 /// Represents a WebSocket client instance.
@@ -375,6 +377,24 @@ impl WebSocket {
     pub fn send(&self, message: &str) -> Result<(), WebSocketClientError> {
         self.command_tx
             .send(ClientCommand::SendMessage(message.to_string()))
+            .map_err(|e| WebSocketClientError::SendError(e.to_string()))
+    }
+
+    /// Enqueues multiple text messages as one writer command.
+    ///
+    /// The runtime holds the writer lock until every message in this burst has
+    /// been written, so frames from another task cannot be interleaved.
+    pub fn send_many<I, S>(&self, messages: I) -> Result<(), WebSocketClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let messages = messages.into_iter().map(Into::into).collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.command_tx
+            .send(ClientCommand::SendMessages(messages))
             .map_err(|e| WebSocketClientError::SendError(e.to_string()))
     }
     pub fn send_command(&self, command: ClientCommand) -> Result<(), WebSocketClientError> {
@@ -604,7 +624,8 @@ async fn run(
                         Ok(ClientCommand::UpdateOptions(opts)) => {
                             options = opts;
                         }
-                        Ok(ClientCommand::SendMessage(message)) => break Some(message),
+                        Ok(ClientCommand::SendMessage(message)) => break Some(vec![message]),
+                        Ok(ClientCommand::SendMessages(messages)) => break Some(messages),
                         Err(mpsc::error::TryRecvError::Empty) => break None,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             shutdown = true;
@@ -615,11 +636,14 @@ async fn run(
                 };
                 callbacks.call_on_open();
                 let mut initial_send_failed = false;
-                if let Some(message) = message {
-                    let result = writer.lock().await.send_string(&message).await;
-                    if let Err(error) = result {
-                        callbacks.call_on_error(error.to_string());
-                        initial_send_failed = true;
+                if let Some(messages) = message {
+                    let mut writer_guard = writer.lock().await;
+                    for message in messages {
+                        if let Err(error) = writer_guard.send_string(&message).await {
+                            callbacks.call_on_error(error.to_string());
+                            initial_send_failed = true;
+                            break;
+                        }
                     }
                 }
                 if shutdown {
@@ -680,6 +704,20 @@ async fn run(
                                         let result = writer.lock().await.send_string(&message).await;
                                         if let Err(error) = result {
                                             callbacks.call_on_error(error.to_string());
+                                            break;
+                                        }
+                                    },
+                                    ClientCommand::SendMessages(messages) => {
+                                        let mut writer_guard = writer.lock().await;
+                                        let mut failed = false;
+                                        for message in messages {
+                                            if let Err(error) = writer_guard.send_string(&message).await {
+                                                callbacks.call_on_error(error.to_string());
+                                                failed = true;
+                                                break;
+                                            }
+                                        }
+                                        if failed {
                                             break;
                                         }
                                     },
